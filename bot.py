@@ -1,10 +1,20 @@
+import asyncio
 import os
-from aiogram import Bot, Dispatcher
-from aiogram.types import Update
-from aiogram.dispatcher.webhook.server import WebhookRequestHandler
-from aiogram.dispatcher.webhook import get_new_configured_app
-from groq import GroqClient
-from fastapi import FastAPI, Request
+import sqlite3
+from datetime import date
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.filters import CommandStart
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
+
+from dotenv import load_dotenv
+from groq import Client
+
+# =================
+# LOAD TOKENS
+# =================
+load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -12,264 +22,318 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Пример команды /start
-@dp.message()
-async def start_handler(message):
-    await message.answer("Привет! Я бот по истории Беларуси.")
+client = Client(api_key=GROQ_API_KEY)
 
-# Настройка Groq
-client = GroqClient(api_key=GROQ_API_KEY)
+# =================
+# DATABASE
+# =================
+conn = sqlite3.connect("history_users.db")
+cursor = conn.cursor()
 
-# FastAPI приложение для Render
-app = FastAPI()
-asgi_app = get_new_configured_app(dp, bot=bot, path="/webhook")
-app.mount("/", asgi_app)
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users(
+id INTEGER PRIMARY KEY,
+score INTEGER DEFAULT 0,
+xp INTEGER DEFAULT 0
+)
+""")
+conn.commit()
 
-# =========================
-# ПАМЯТЬ
-# =========================
-user_scores = {}
-user_xp = {}
-quiz_answers = {}
+# =================
+# MEMORY
+# =================
 user_modes = {}
 user_history = {}
+quiz_answers = {}
 quest_stage = {}
+exam_mode = {}
 
-# =========================
-# SYSTEM PROMPT
-# =========================
+# =================
+# ACHIEVEMENTS
+# =================
+achievements = {
+    10: "🎖 Новичок истории",
+    50: "🏺 Знаток ВКЛ",
+    100: "👑 Магистр истории"
+}
+
+# =================
+# PROMPT
+# =================
 SYSTEM_PROMPT = """
-Ты AI-учитель истории Беларуси.
-Любые вопросы, не связанные с Историей Беларуси отклоняй.(Исключение: пункты меню)
-Отвечай только на вопросы про историю Беларуси.
+Ты AI учитель истории Беларуси.
+Отвечай только на вопросы по истории Беларуси.
 Объясняй понятно для подростков.
-Отвечай кратко и интересно.
-Ищи инфомрацию в следующих источниках:
-https://ru.wikipedia.org/wiki/%D0%98%D1%81%D1%82%D0%BE%D1%80%D0%B8%D1%8F_%D0%91%D0%B5%D0%BB%D0%B0%D1%80%D1%83%D1%81%D0%B8?
 """
 
-# =========================
-# LEVEL SYSTEM
-# =========================
+# =================
+# UTILS
+# =================
 def get_level(xp):
-    return xp // 10 + 1
+    return xp // 20 + 1
 
-# =========================
-# MAIN MENU
-# =========================
+def get_user(uid):
+    cursor.execute("SELECT score,xp FROM users WHERE id=?", (uid,))
+    user = cursor.fetchone()
+    if not user:
+        cursor.execute("INSERT INTO users(id,score,xp) VALUES(?,?,?)", (uid,0,0))
+        conn.commit()
+        return (0,0)
+    return user
+
+def add_score(uid):
+    cursor.execute("UPDATE users SET score=score+1 WHERE id=?", (uid,))
+    conn.commit()
+
+def add_xp(uid,xp):
+    cursor.execute("UPDATE users SET xp=xp+? WHERE id=?", (xp,uid))
+    conn.commit()
+
+def get_achievement(xp):
+    result = None
+    for req, name in achievements.items():
+        if xp >= req:
+            result = name
+    return result
+
+async def send_long_message(message,text):
+    limit = 3900
+    parts = [text[i:i+limit] for i in range(0,len(text),limit)]
+    for p in parts:
+        await message.answer(p)
+
+# =================
+# AI
+# =================
+async def groq_chat(messages):
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=500
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"AI ошибка: {e}"
+
+# =================
+# MENU
+# =================
 def main_menu():
     kb = ReplyKeyboardBuilder()
     kb.button(text="📚 Спросить ИИ")
+    kb.button(text="📖 Объясни тему")
     kb.button(text="🎮 Викторина")
+    kb.button(text="🔥 Викторина дня")
+    kb.button(text="🎓 AI Экзамен")
     kb.button(text="🧩 Исторический квест")
-    kb.button(text="🎓 Подготовка к экзамену")
-    kb.button(text="🗺 Карта Беларуси")
     kb.button(text="📅 Событие дня")
+    kb.button(text="👤 Профиль")
     kb.button(text="🏆 Лидеры")
-    kb.button(text="📊 Мой счёт")
-    kb.button(text="🏅 Мой уровень")
     kb.adjust(2)
     return kb.as_markup(resize_keyboard=True)
 
-# =========================
-# AI CHAT через актуальный SDK
-# =========================
-async def groq_chat_sdk(messages):
-    """
-    messages = [{"role": "system/user/assistant", "content": "..."}]
-    """
-    response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
-        messages=messages
-    )
-    return response.choices[0].message.content
-
-# =========================
+# =================
 # START
-# =========================
+# =================
 @dp.message(CommandStart())
 async def start(message: Message):
-    uid = message.from_user.id
-    user_scores.setdefault(uid,0)
-    user_xp.setdefault(uid,0)
-    user_history.setdefault(uid,[])
+    get_user(message.from_user.id)
     await message.answer(
-        "🇧🇾 AI бот для изучения истории Беларуси\n\nВыбери режим:",
+        "🇧🇾 AI бот для изучения истории Беларуси",
         reply_markup=main_menu()
     )
 
-# =========================
-# AI MODE
-# =========================
-@dp.message(F.text == "📚 Спросить ИИ")
+# =================
+# PROFILE
+# =================
+@dp.message(F.text=="👤 Профиль")
+async def profile(message: Message):
+    score,xp = get_user(message.from_user.id)
+    level = get_level(xp)
+    ach = get_achievement(xp)
+    text=f"""
+👤 Профиль
+🏆 Баллы: {score}
+⭐ XP: {xp}
+🎖 Уровень: {level}
+"""
+    if ach:
+        text += f"\n🏅 Достижение: {ach}"
+    await message.answer(text)
+
+# =================
+# AI CHAT
+# =================
+@dp.message(F.text=="📚 Спросить ИИ")
 async def ai_mode(message: Message):
     user_modes[message.from_user.id] = "ai"
-    await message.answer("Задай любой вопрос по истории Беларуси.")
+    await message.answer("Задай вопрос по истории Беларуси")
 
-@dp.message()
-async def ai_chat(message: Message):
-    uid = message.from_user.id
-    if user_modes.get(uid,"ai") != "ai":
-        return
-    history = user_history.setdefault(uid, [])
-    history.append({"role":"user","content":message.text})
-    messages = [{"role":"system","content":SYSTEM_PROMPT}] + history[-6:]
-    try:
-        answer = await groq_chat_sdk(messages)
-    except Exception as e:
-        answer = f"Ошибка AI: {e}"
-    history.append({"role":"assistant","content":answer})
-    await message.answer(answer)
+# =================
+# EXPLAIN MODE
+# =================
+@dp.message(F.text=="📖 Объясни тему")
+async def explain_mode(message: Message):
+    user_modes[message.from_user.id] = "explain"
+    await message.answer("Напиши тему")
 
-# =========================
-# ВИКТОРИНА
-# =========================
-@dp.message(F.text == "🎮 Викторина")
+# =================
+# DAILY QUIZ
+# =================
+@dp.message(F.text=="🔥 Викторина дня")
+async def daily_quiz(message: Message):
+    prompt="Создай один вопрос викторины по истории Беларуси."
+    answer = await groq_chat([{"role":"user","content":prompt}])
+    await send_long_message(message,answer)
+
+# =================
+# QUIZ
+# =================
+@dp.message(F.text=="🎮 Викторина")
 async def quiz(message: Message):
     kb = InlineKeyboardBuilder()
-    kb.button(text="Лёгкий", callback_data="quiz_easy")
-    kb.button(text="Средний", callback_data="quiz_medium")
-    kb.button(text="Сложный", callback_data="quiz_hard")
+    kb.button(text="Лёгкий",callback_data="quiz_easy")
+    kb.button(text="Средний",callback_data="quiz_medium")
+    kb.button(text="Сложный",callback_data="quiz_hard")
     kb.adjust(1)
-    await message.answer("Выбери уровень:", reply_markup=kb.as_markup())
+    await message.answer("Выбери уровень",reply_markup=kb.as_markup())
 
 @dp.callback_query(F.data.startswith("quiz_"))
 async def quiz_question(callback: CallbackQuery):
     level = callback.data.split("_")[1]
-    prompt = f"""
-Создай {level} вопрос викторины по истории Беларуси.
-
-Формат:
-Вопрос
-A)
-B)
-C)
-D)
-
-Правильный ответ: A
-"""
-    answer = await groq_chat_sdk([{"role":"user","content":prompt}])
-    correct = None
+    prompt=f"Создай {level} вопрос по истории Беларуси.\nФормат:\nВопрос\nA)\nB)\nC)\nD)\nПравильный ответ: A"
+    answer = await groq_chat([{"role":"user","content":prompt}])
+    correct = "A"
     for line in answer.split("\n"):
-        if "Правильный ответ" in line:
-            correct = line.strip()[-1]
+        if "Правильный" in line:
+            correct = line[-1]
     quiz_answers[callback.from_user.id] = correct
-
     kb = InlineKeyboardBuilder()
-    kb.button(text="A", callback_data="ans_A")
-    kb.button(text="B", callback_data="ans_B")
-    kb.button(text="C", callback_data="ans_C")
-    kb.button(text="D", callback_data="ans_D")
+    kb.button(text="A",callback_data="ans_A")
+    kb.button(text="B",callback_data="ans_B")
+    kb.button(text="C",callback_data="ans_C")
+    kb.button(text="D",callback_data="ans_D")
     kb.adjust(4)
-    await callback.message.answer(answer, reply_markup=kb.as_markup())
+    await callback.message.answer(answer,reply_markup=kb.as_markup())
 
 @dp.callback_query(F.data.startswith("ans_"))
 async def quiz_answer(callback: CallbackQuery):
     uid = callback.from_user.id
-    user_answer = callback.data.split("_")[1]
+    ans = callback.data.split("_")[1]
     correct = quiz_answers.get(uid)
-    if user_answer == correct:
-        user_scores[uid]+=1
-        user_xp[uid]+=3
-        await callback.message.answer("✅ Верно! +1 балл")
+    if ans == correct:
+        add_score(uid)
+        add_xp(uid,5)
+        await callback.message.answer("✅ Верно")
     else:
-        await callback.message.answer(f"❌ Неверно. Ответ: {correct}")
+        await callback.message.answer(f"❌ Ответ: {correct}")
 
-# =========================
-# СЧЁТ
-# =========================
-@dp.message(F.text == "📊 Мой счёт")
-async def score(message: Message):
-    score = user_scores.get(message.from_user.id,0)
-    await message.answer(f"Твой счёт: {score}")
+# =================
+# EXAM
+# =================
+@dp.message(F.text=="🎓 AI Экзамен")
+async def exam(message: Message):
+    exam_mode[message.from_user.id] = True
+    prompt="Задай сложный экзаменационный вопрос по истории Беларуси"
+    answer = await groq_chat([{"role":"user","content":prompt}])
+    await send_long_message(message,answer)
 
-# =========================
-# УРОВЕНЬ
-# =========================
-@dp.message(F.text == "🏅 Мой уровень")
-async def level(message: Message):
-    xp = user_xp.get(message.from_user.id,0)
-    lvl = get_level(xp)
-    await message.answer(f"🏅 Уровень: {lvl}\n⭐ Опыт: {xp}")
+# =================
+# EVENT
+# =================
+@dp.message(F.text=="📅 Событие дня")
+async def event(message: Message):
+    today = date.today().strftime("%d %B")
+    prompt = f"Что произошло {today} в истории Беларуси?"
+    answer = await groq_chat([{"role":"user","content":prompt}])
+    await send_long_message(message,answer)
 
-# =========================
-# ЛИДЕРЫ
-# =========================
-@dp.message(F.text == "🏆 Лидеры")
+# =================
+# LEADERS
+# =================
+@dp.message(F.text=="🏆 Лидеры")
 async def leaders(message: Message):
-    top = sorted(user_scores.items(), key=lambda x:x[1], reverse=True)
-    text = "🏆 Таблица лидеров\n\n"
-    for i,(user,score) in enumerate(top[:10]):
-        text += f"{i+1}. {score} баллов\n"
+    cursor.execute("SELECT score FROM users ORDER BY score DESC LIMIT 10")
+    rows = cursor.fetchall()
+    text="🏆 Лидеры\n\n"
+    for i,row in enumerate(rows):
+        text += f"{i+1}. {row[0]} баллов\n"
     await message.answer(text)
 
-# =========================
-# СОБЫТИЕ ДНЯ
-# =========================
-@dp.message(F.text == "📅 Событие дня")
-async def day_event(message: Message):
-    today = date.today().strftime("%d %B")
-    prompt = f"Какое событие произошло {today} в истории Беларуси?"
-    answer = await groq_chat_sdk([{"role":"user","content":prompt}])
-    await message.answer(answer)
+# =================
+# QUEST
+# =================
+quest=[
+    ("Ты в Полоцке XI века. Кто был князем?", "всеслав"),
+    ("Назови первого белорусского печатника", "скорина"),
+    ("Столица ВКЛ?", "вильн"),
+    ("Кто возглавил восстание 1863?", "калинов"),
+    ("Как называется парламент Беларуси?", "национ"),
+    ("Назови Мирский замок", "мир")
+]
 
-# =========================
-# КАРТА
-# =========================
-@dp.message(F.text == "🗺 Карта Беларуси")
-async def map_menu(message: Message):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Минск", callback_data="city_minsk")
-    kb.button(text="Полоцк", callback_data="city_polotsk")
-    kb.button(text="Гродно", callback_data="city_grodno")
-    kb.button(text="Брест", callback_data="city_brest")
-    kb.adjust(2)
-    await message.answer("Выбери город:", reply_markup=kb.as_markup())
+@dp.message(F.text=="🧩 Исторический квест")
+async def quest_start(message: Message):
+    quest_stage[message.from_user.id] = 0
+    await message.answer(quest[0][0])
 
-@dp.callback_query(F.data.startswith("city_"))
-async def city_info(callback: CallbackQuery):
-    city = callback.data.split("_")[1]
-    prompt = f"Расскажи кратко историю города {city} в Беларуси."
-    answer = await groq_chat_sdk([{"role":"user","content":prompt}])
-    await callback.message.answer(answer)
-
-# =========================
-# ИСТОРИЧЕСКИЙ КВЕСТ
-# =========================
-@dp.message(F.text == "🧩 Исторический квест")
-async def start_quest(message: Message):
-    quest_stage[message.from_user.id] = 1
-    await message.answer(
-        "🧩 Квест начался!\nТы оказался в Полоцке XI века.\nКто был князем Полоцка?"
-    )
-
+# =================
+# MAIN HANDLER
+# =================
 @dp.message()
-async def quest_answer(message: Message):
+async def handle(message: Message):
     uid = message.from_user.id
-    stage = quest_stage.get(uid)
-    if stage == 1:
-        if "всеслав" in message.text.lower():
-            quest_stage[uid] = 2
-            user_xp[uid] += 5
-            await message.answer(
-                "Верно! Это Всеслав Чародей.\nСледующая задача:\nНазови первого белорусского печатника."
-            )
-        else:
-            await message.answer("Попробуй ещё!")
-    elif stage == 2:
-        if "скорина" in message.text.lower():
-            quest_stage[uid] = 3
-            user_xp[uid] += 5
-            await message.answer("Правильно! Это Франциск Скорина.\nКвест завершён 🎉")
-        else:
-            await message.answer("Попробуй ещё.")
 
-# =========================
+    # QUEST
+    if uid in quest_stage:
+        stage = quest_stage[uid]
+        if quest[stage][1] in message.text.lower():
+            add_xp(uid,10)
+            stage += 1
+            if stage >= len(quest):
+                await message.answer("🎉 Квест пройден")
+                quest_stage.pop(uid)
+                return
+            quest_stage[uid] = stage
+            await message.answer("✅ Верно\n" + quest[stage][0])
+        else:
+            await message.answer("❌ Попробуй ещё")
+        return
+
+    # EXAM
+    if exam_mode.get(uid):
+        prompt = f"Проверь ответ ученика:\n{message.text}\nОцени и объясни."
+        answer = await groq_chat([{"role":"user","content":prompt}])
+        exam_mode.pop(uid)
+        await send_long_message(message,answer)
+        return
+
+    # EXPLAIN
+    if user_modes.get(uid) == "explain":
+        prompt = f"Объясни тему истории Беларуси:\n{message.text}\nПросто для школьника."
+        answer = await groq_chat([{"role":"user","content":prompt}])
+        user_modes.pop(uid)
+        await send_long_message(message,answer)
+        return
+
+    # AI CHAT
+    if user_modes.get(uid) == "ai":
+        history = user_history.setdefault(uid,[])
+        history.append({"role":"user","content":message.text})
+        messages = [{"role":"system","content":SYSTEM_PROMPT}] + history[-6:]
+        answer = await groq_chat(messages)
+        history.append({"role":"assistant","content":answer})
+        await send_long_message(message,answer)
+        return
+
+# =================
 # RUN
-# =========================
+# =================
 async def main():
     print("Bot started")
     await dp.start_polling(bot)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     asyncio.run(main())
